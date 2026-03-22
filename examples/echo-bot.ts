@@ -6,7 +6,7 @@
  *   - File-based credential persistence (the library itself is stateless)
  *   - QR code rendering via qrcode-terminal (the library only returns URLs)
  *   - Sync buf persistence for message resume across restarts
- *   - Handling all message types (text, image, voice, file, video)
+ *   - Echoing back every message type: text, image, video, file, voice
  *
  * Prerequisites:
  *   pnpm add qrcode-terminal               # for inline QR code rendering
@@ -18,6 +18,7 @@
  *
  * Press Ctrl+C to stop.
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +37,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const STATE_DIR = path.join(os.homedir(), ".wechat-echo-bot");
+const TEMP_DIR = path.join(STATE_DIR, "tmp");
 
 interface SavedCredentials {
   accountId: string;
@@ -44,8 +46,8 @@ interface SavedCredentials {
   userId?: string;
 }
 
-function ensureStateDir(): void {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
+function ensureDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true });
 }
 
 function credentialsPath(): string {
@@ -66,7 +68,7 @@ function loadCredentials(): SavedCredentials | null {
 }
 
 function saveCredentials(creds: SavedCredentials): void {
-  ensureStateDir();
+  ensureDir(STATE_DIR);
   const filePath = credentialsPath();
   fs.writeFileSync(filePath, JSON.stringify(creds, null, 2), "utf-8");
   try { fs.chmodSync(filePath, 0o600); } catch { /* best-effort */ }
@@ -83,8 +85,38 @@ function loadSyncBuf(): string | undefined {
 }
 
 function saveSyncBuf(buf: string): void {
-  ensureStateDir();
+  ensureDir(STATE_DIR);
   fs.writeFileSync(syncBufPath(), JSON.stringify({ buf }), "utf-8");
+}
+
+// ---------------------------------------------------------------------------
+// Temp file helpers
+// ---------------------------------------------------------------------------
+
+const MEDIA_EXTENSIONS: Record<string, string> = {
+  image: ".jpg",
+  video: ".mp4",
+  voice: ".silk",
+  file: ".bin",
+};
+
+/**
+ * Write a buffer to a temp file and return its path.
+ * The caller can pass a preferred filename (for file attachments).
+ */
+function writeTempFile(data: Buffer, kind: string, fileName?: string): string {
+  ensureDir(TEMP_DIR);
+  const ext = fileName
+    ? path.extname(fileName) || MEDIA_EXTENSIONS[kind] || ".bin"
+    : MEDIA_EXTENSIONS[kind] || ".bin";
+  const name = fileName ?? `echo-${kind}-${crypto.randomBytes(4).toString("hex")}${ext}`;
+  const filePath = path.join(TEMP_DIR, name);
+  fs.writeFileSync(filePath, data);
+  return filePath;
+}
+
+function cleanupTempFile(filePath: string): void {
+  try { fs.unlinkSync(filePath); } catch { /* ignore */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +128,6 @@ async function renderQRCode(url: string): Promise<void> {
     const qrt = await import("qrcode-terminal");
     qrt.default.generate(url, { small: true });
   } catch {
-    // qrcode-terminal not installed — just print the URL
     console.log(`QR Code URL: ${url}`);
     console.log("(install qrcode-terminal for inline QR rendering)");
   }
@@ -105,13 +136,6 @@ async function renderQRCode(url: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-const MEDIA_TYPE_LABELS: Record<number, string> = {
-  [MessageItemType.IMAGE]: "image",
-  [MessageItemType.VOICE]: "voice",
-  [MessageItemType.FILE]: "file",
-  [MessageItemType.VIDEO]: "video",
-};
 
 function timestamp(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
@@ -129,34 +153,52 @@ function describeItems(items: MessageItem[]): string {
         parts.push(`text: "${item.text_item?.text ?? ""}"`);
         break;
       case MessageItemType.IMAGE:
-        parts.push(
-          `image (mid_size=${item.image_item?.mid_size ?? "?"}, ` +
-            `thumb=${item.image_item?.thumb_width ?? "?"}x${item.image_item?.thumb_height ?? "?"})`,
-        );
+        parts.push(`image (mid_size=${item.image_item?.mid_size ?? "?"})`);
         break;
       case MessageItemType.VOICE:
         parts.push(
-          `voice (${item.voice_item?.playtime ?? "?"}ms, ` +
-            `encode=${item.voice_item?.encode_type ?? "?"})` +
+          `voice (${item.voice_item?.playtime ?? "?"}ms)` +
             (item.voice_item?.text ? ` [STT: "${item.voice_item.text}"]` : ""),
         );
         break;
       case MessageItemType.FILE:
-        parts.push(
-          `file: "${item.file_item?.file_name ?? "?"}" (${item.file_item?.len ?? "?"} bytes)`,
-        );
+        parts.push(`file: "${item.file_item?.file_name ?? "?"}" (${item.file_item?.len ?? "?"} bytes)`);
         break;
       case MessageItemType.VIDEO:
-        parts.push(
-          `video (${item.video_item?.play_length ?? "?"}s, ` +
-            `${item.video_item?.video_size ?? "?"} bytes)`,
-        );
+        parts.push(`video (${item.video_item?.play_length ?? "?"}s)`);
         break;
       default:
         parts.push(`unknown type=${item.type}`);
     }
   }
   return parts.join(", ");
+}
+
+// ---------------------------------------------------------------------------
+// Media echo: download -> save to temp -> re-upload and send back
+// ---------------------------------------------------------------------------
+
+/**
+ * Download a media item from an inbound message, then re-upload and send
+ * it back to the sender. Returns true if a media item was echoed.
+ */
+async function echoMediaItem(
+  client: WeChatClient,
+  from: string,
+  item: MessageItem,
+  caption?: string,
+): Promise<boolean> {
+  const downloaded = await client.downloadMedia(item);
+  if (!downloaded) return false;
+
+  const tempPath = writeTempFile(downloaded.data, downloaded.kind, downloaded.fileName);
+  try {
+    await client.sendMedia(from, tempPath, caption);
+    log(`--> [${from}] echoed ${downloaded.kind} (${downloaded.data.length} bytes)${caption ? ` + "${caption}"` : ""}`);
+  } finally {
+    cleanupTempFile(tempPath);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +257,6 @@ async function main(): Promise<void> {
 
     log(`Logged in as ${result.accountId}`);
 
-    // Persist credentials (caller's responsibility — the library won't do this)
     saveCredentials({
       accountId: normalizeAccountId(result.accountId!),
       token: result.botToken!,
@@ -236,28 +277,35 @@ async function main(): Promise<void> {
     log(`<-- [${from}] ${describeItems(items)}`);
 
     const text = WeChatClient.extractText(msg);
-    const hasMedia = items.some((i) => WeChatClient.isMediaItem(i));
+    const mediaItems = items.filter((i) => WeChatClient.isMediaItem(i));
 
     try {
-      if (text && !hasMedia) {
+      if (mediaItems.length > 0) {
+        // Echo each media item back, with text as caption on the first one
+        for (let i = 0; i < mediaItems.length; i++) {
+          const caption = i === 0 && text ? `Echo: ${text}` : undefined;
+          const echoed = await echoMediaItem(client!, from, mediaItems[i], caption);
+          if (!echoed) {
+            // Download/upload failed for this item — fall back to text description
+            log(`    [${from}] could not echo media item type=${mediaItems[i].type}, skipping`);
+          }
+        }
+        // If there was text but no media was successfully echoed, send text reply
+        if (text && !mediaItems.some((_, idx) => idx >= 0)) {
+          await client!.sendText(from, `Echo: ${text}`);
+        }
+      } else if (text) {
+        // Pure text message — echo it back
         const reply = `Echo: ${text}`;
         await client!.sendText(from, reply);
         log(`--> [${from}] ${reply}`);
-      } else if (hasMedia) {
-        const mediaTypes = items
-          .filter((i) => WeChatClient.isMediaItem(i))
-          .map((i) => MEDIA_TYPE_LABELS[i.type ?? 0] ?? "unknown")
-          .join(", ");
-        let reply = `Received: ${mediaTypes}`;
-        if (text) reply += `\nCaption: "${text}"`;
-        await client!.sendText(from, reply);
-        log(`--> [${from}] ${reply}`);
       } else {
+        // Empty message
         await client!.sendText(from, "Received an empty message.");
         log(`--> [${from}] (empty message ack)`);
       }
     } catch (err) {
-      log(`Error sending reply to ${from}: ${err}`);
+      log(`Error replying to ${from}: ${err}`);
     }
   });
 
@@ -282,7 +330,6 @@ async function main(): Promise<void> {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  // Pass sync buf callbacks so the long-poll cursor survives restarts
   await client.start({
     loadSyncBuf,
     saveSyncBuf,
