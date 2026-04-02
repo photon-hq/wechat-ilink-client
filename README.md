@@ -308,6 +308,18 @@ examples/
   echo-bot.ts              Complete echo bot (with its own persistence + QR rendering)
 ```
 
+## Scripts
+
+### WeChat-Claude Bridge
+
+`scripts/wechat-claude-bridge.ts` — Bridge WeChat messages to Claude Code via stream-json. Receives WeChat user messages, forwards them to a Claude CLI child process, and sends assistant responses back to WeChat in real time.
+
+```bash
+npx tsx scripts/wechat-claude-bridge.ts --token <token> --account-id <account-id>
+# or via env vars
+ILINK_TOKEN=xxx ILINK_ACCOUNT_ID=xxx npx tsx scripts/wechat-claude-bridge.ts
+```
+
 ## License
 
 MIT
