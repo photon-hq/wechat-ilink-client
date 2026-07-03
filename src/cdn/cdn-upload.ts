@@ -12,14 +12,24 @@ const UPLOAD_MAX_RETRIES = 3;
  */
 export async function uploadBufferToCdn(params: {
   buf: Buffer;
-  uploadParam: string;
+  /** Encrypted upload param (older API); URL is built from it + filekey. */
+  uploadParam?: string;
+  /** Complete upload URL (newer API); used verbatim, takes precedence. */
+  uploadFullUrl?: string;
   filekey: string;
   cdnBaseUrl: string;
   aeskey: Buffer;
 }): Promise<{ downloadParam: string }> {
-  const { buf, uploadParam, filekey, cdnBaseUrl, aeskey } = params;
+  const { buf, uploadParam, uploadFullUrl, filekey, cdnBaseUrl, aeskey } = params;
   const ciphertext = encryptAesEcb(buf, aeskey);
-  const cdnUrl = buildCdnUploadUrl({ cdnBaseUrl, uploadParam, filekey });
+  const cdnUrl =
+    uploadFullUrl ??
+    (uploadParam != null
+      ? buildCdnUploadUrl({ cdnBaseUrl, uploadParam, filekey })
+      : undefined);
+  if (!cdnUrl) {
+    throw new Error("uploadBufferToCdn: neither uploadFullUrl nor uploadParam provided");
+  }
 
   let downloadParam: string | undefined;
   let lastError: unknown;

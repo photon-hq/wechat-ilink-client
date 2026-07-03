@@ -67,15 +67,17 @@ async function uploadMedia(params: {
   });
 
   const uploadParam = uploadUrlResp.upload_param;
-  if (!uploadParam) {
+  const uploadFullUrl = uploadUrlResp.upload_full_url;
+  if (!uploadParam && !uploadFullUrl) {
     throw new Error(
-      `getUploadUrl returned no upload_param: ${JSON.stringify(uploadUrlResp)}`,
+      `getUploadUrl returned neither upload_param nor upload_full_url: ${JSON.stringify(uploadUrlResp)}`,
     );
   }
 
   const { downloadParam } = await uploadBufferToCdn({
     buf: plaintext,
     uploadParam,
+    uploadFullUrl,
     filekey,
     cdnBaseUrl,
     aeskey,
