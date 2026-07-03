@@ -234,6 +234,14 @@ export interface GetUploadUrlResp {
   upload_param?: string;
   /** Thumbnail upload encrypted parameters. */
   thumb_upload_param?: string;
+  /**
+   * Newer server variant: a complete upload URL whose query string already
+   * carries `encrypted_query_param`, `filekey`, and `taskid`. When present it
+   * is used verbatim instead of building the URL from `upload_param`.
+   */
+  upload_full_url?: string;
+  /** Newer server variant of the thumbnail upload URL. */
+  thumb_upload_full_url?: string;
 }
 
 // ---------------------------------------------------------------------------
